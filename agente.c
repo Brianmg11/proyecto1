@@ -2,6 +2,9 @@
  * Agente del sistema SIEMLite Distribuido.
  * Recolecta logs (journalctl) y metricas (free, df, ps) del sistema,
  * y los envia a un servidor central utilizando un protocolo confiable sobre UDP.
+ *
+ * Utiliza memoria compartida y procesos hijos persistentes para el monitoreo
+ * continuo de los logs.
  */
 
 #include <stdio.h>
@@ -16,30 +19,111 @@
 #include <signal.h>
 #include <time.h>
 #include <libgen.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <errno.h>
 #include "protocolo.h"
 
 #define MAX_SERVICIOS 10
 #define NUM_PRIORIDADES 8
 #define MAX_NOMBRE 64
 #define MAX_BUFFER 4096
+#define SEM_NOMBRE "/siemlite_agente_sem"
+#define SHM_LLAVE 0x5349454D
 
-/* Estructura para almacenar resultados locales temporalmente */
-typedef struct {
-    char nombre[MAX_NOMBRE];
-    int contadores[NUM_PRIORIDADES];
-} LogsServicio;
-
+/* Estructura para métricas */
 typedef struct {
     int mem_pct;
     int disk_pct;
     int procs;
 } MetricasSistema;
 
+/* Estructura para la memoria compartida */
+typedef struct {
+    int ejecutando;
+    struct {
+        char nombre[MAX_NOMBRE];
+        int contadores[NUM_PRIORIDADES];
+    } servicios[MAX_SERVICIOS];
+} DatosCompartidosAgente;
+
 static volatile sig_atomic_t g_terminar = 0;
+static int g_shm_id = -1;
+static DatosCompartidosAgente *g_shm = NULL;
+static sem_t *g_sem = NULL;
+static pid_t g_pids[MAX_SERVICIOS];
+static int g_num_hijos = 0;
 
 static void manejar_senal(int sig) {
     (void)sig;
     g_terminar = 1;
+    if (g_shm != NULL) {
+        g_shm->ejecutando = 0;
+    }
+}
+
+/* ================================================================
+ *           MEMORIA COMPARTIDA Y SEMAFOROS
+ * ================================================================ */
+
+static int crear_recursos_ipc(int n_servicios, char **nombres) {
+    size_t tam = sizeof(DatosCompartidosAgente);
+
+    /* Limpiar segmento anterior si existe */
+    int id_viejo = shmget(SHM_LLAVE, tam, 0666);
+    if (id_viejo != -1) {
+        shmctl(id_viejo, IPC_RMID, NULL);
+    }
+
+    g_shm_id = shmget(SHM_LLAVE, tam, IPC_CREAT | IPC_EXCL | 0666);
+    if (g_shm_id == -1) {
+        perror("shmget");
+        return -1;
+    }
+
+    g_shm = (DatosCompartidosAgente *)shmat(g_shm_id, NULL, 0);
+    if (g_shm == (void *)-1) {
+        perror("shmat");
+        return -1;
+    }
+
+    memset(g_shm, 0, tam);
+    g_shm->ejecutando = 1;
+    for (int i = 0; i < n_servicios; i++) {
+        strncpy(g_shm->servicios[i].nombre, nombres[i], MAX_NOMBRE - 1);
+    }
+
+    sem_unlink(SEM_NOMBRE);
+    g_sem = sem_open(SEM_NOMBRE, O_CREAT | O_EXCL, 0666, 1);
+    if (g_sem == SEM_FAILED) {
+        perror("sem_open");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void limpiar_recursos(void) {
+    for (int i = 0; i < g_num_hijos; i++) {
+        if (g_pids[i] > 0) {
+            kill(g_pids[i], SIGTERM);
+            waitpid(g_pids[i], NULL, 0);
+        }
+    }
+    if (g_shm != NULL) {
+        shmdt(g_shm);
+        g_shm = NULL;
+    }
+    if (g_shm_id != -1) {
+        shmctl(g_shm_id, IPC_RMID, NULL);
+        g_shm_id = -1;
+    }
+    if (g_sem != NULL) {
+        sem_close(g_sem);
+        sem_unlink(SEM_NOMBRE);
+        g_sem = NULL;
+    }
 }
 
 /* ================================================================
@@ -61,10 +145,8 @@ static int extraer_prioridad(const char *linea) {
     return -1;
 }
 
-static void consultar_logs(const char *servicio, int intervalo, LogsServicio *out) {
+static void consultar_logs(int idx, const char *servicio, int intervalo) {
     int fd_pipe[2];
-    memset(out->contadores, 0, sizeof(out->contadores));
-    strncpy(out->nombre, servicio, MAX_NOMBRE - 1);
 
     if (pipe(fd_pipe) == -1) return;
 
@@ -93,20 +175,69 @@ static void consultar_logs(const char *servicio, int intervalo, LogsServicio *ou
     }
 
     close(fd_pipe[1]);
+    
+    int conteo[NUM_PRIORIDADES] = {0};
+    
     FILE *fp = fdopen(fd_pipe[0], "r");
     if (fp != NULL) {
         char linea[MAX_BUFFER];
         while (fgets(linea, sizeof(linea), fp) != NULL) {
             int p = extraer_prioridad(linea);
             if (p >= 0 && p < NUM_PRIORIDADES) {
-                out->contadores[p]++;
+                conteo[p]++;
             }
         }
         fclose(fp);
     } else {
         close(fd_pipe[0]);
     }
+    
     waitpid(pid, NULL, 0);
+    
+    /* Guardar en memoria compartida (acumular) */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 2;
+    if (sem_timedwait(g_sem, &ts) == 0) {
+        for (int p = 0; p < NUM_PRIORIDADES; p++) {
+            g_shm->servicios[idx].contadores[p] += conteo[p];
+        }
+        sem_post(g_sem);
+    }
+}
+
+static void proceso_hijo_monitor(int idx, const char *servicio, int intervalo) {
+    signal(SIGTERM, manejar_senal);
+    signal(SIGINT, SIG_DFL);
+
+    while (!g_terminar) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+        if (sem_timedwait(g_sem, &ts) == 0) {
+            if (!g_shm->ejecutando) {
+                sem_post(g_sem);
+                break;
+            }
+            sem_post(g_sem);
+        }
+
+        time_t inicio = time(NULL);
+        consultar_logs(idx, servicio, intervalo);
+        time_t transcurrido = time(NULL) - inicio;
+
+        int dormir = intervalo - (int)transcurrido;
+        if (dormir > 0 && !g_terminar) {
+            sleep(dormir);
+        }
+    }
+
+    if (g_shm != NULL) {
+        shmdt(g_shm);
+    }
+    if (g_sem != NULL) {
+        sem_close(g_sem);
+    }
 }
 
 /* ================================================================
@@ -356,11 +487,31 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, manejar_senal);
     signal(SIGTERM, manejar_senal);
 
+    if (crear_recursos_ipc(n_servicios, servicios) != 0) {
+        fprintf(stderr, "Error al crear memoria compartida.\n");
+        return EXIT_FAILURE;
+    }
+
+    for (int i = 0; i < n_servicios && i < MAX_SERVICIOS; i++) {
+        pid_t pid = fork();
+        if (pid == -1) {
+            perror("fork");
+            limpiar_recursos();
+            return EXIT_FAILURE;
+        }
+        if (pid == 0) {
+            proceso_hijo_monitor(i, servicios[i], intervalo);
+            _exit(EXIT_SUCCESS);
+        }
+        g_pids[i] = pid;
+        g_num_hijos++;
+    }
+
     char temp_filename[64];
     snprintf(temp_filename, sizeof(temp_filename), "datos_agente_%d.dat", getpid());
     
     printf("=== Agente SIEMLite Iniciado ===\n");
-    printf("Servidor: %s:%d\nIntervalo: %d seg\n", host, puerto, intervalo);
+    printf("Servidor: %s:%d\nIntervalo: %d seg\nProcesos Hijos Activos: %d\n", host, puerto, intervalo, g_num_hijos);
 
     while (!g_terminar) {
         printf("\nRecolectando informacion...\n");
@@ -368,24 +519,30 @@ int main(int argc, char *argv[]) {
         MetricasSistema metricas;
         recolectar_metricas(&metricas);
         
-        LogsServicio logs[MAX_SERVICIOS];
-        for (int i = 0; i < n_servicios && i < MAX_SERVICIOS; i++) {
-            consultar_logs(servicios[i], intervalo, &logs[i]);
+        /* Copia local de los datos para no bloquear mucho el semaforo */
+        DatosCompartidosAgente copia_shm;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+        if (sem_timedwait(g_sem, &ts) == 0) {
+            memcpy(&copia_shm, g_shm, sizeof(DatosCompartidosAgente));
+            sem_post(g_sem);
+        } else {
+            memset(&copia_shm, 0, sizeof(DatosCompartidosAgente));
         }
         
         /* Escribir a archivo temporal */
         FILE *f = fopen(temp_filename, "w");
         if (f) {
-            /* El formato debe ser facil de leer por el servidor */
             fprintf(f, "METRICS\n");
             fprintf(f, "MEM_PCT %d\n", metricas.mem_pct);
             fprintf(f, "DISK_PCT %d\n", metricas.disk_pct);
             fprintf(f, "PROCS %d\n", metricas.procs);
             fprintf(f, "SERVICES %d\n", n_servicios);
             for (int i = 0; i < n_servicios && i < MAX_SERVICIOS; i++) {
-                fprintf(f, "SVC %s", logs[i].nombre);
+                fprintf(f, "SVC %s", copia_shm.servicios[i].nombre);
                 for (int p = 0; p < NUM_PRIORIDADES; p++) {
-                    fprintf(f, " %d", logs[i].contadores[p]);
+                    fprintf(f, " %d", copia_shm.servicios[i].contadores[p]);
                 }
                 fprintf(f, "\n");
             }
@@ -399,14 +556,14 @@ int main(int argc, char *argv[]) {
             }
         }
         
-        /* Dormir hasta el proximo intervalo, chequeando g_terminar */
+        /* Dormir hasta el proximo intervalo */
         int restante = intervalo;
         while (restante > 0 && !g_terminar) {
             restante = sleep(restante);
         }
     }
     
-    /* Limpiar */
+    limpiar_recursos();
     remove(temp_filename);
     printf("\nAgente finalizado.\n");
     return EXIT_SUCCESS;
